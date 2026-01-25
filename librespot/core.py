@@ -72,12 +72,14 @@ class ApiClient(Closeable):
     """ """
     logger = logging.getLogger("Librespot:ApiClient")
     __base_url: str
+    __metadata_base_url: str
     __client_token_str: str = None
     __session: Session
 
     def __init__(self, session: Session):
         self.__session = session
         self.__base_url = "https://{}".format(ApResolver.get_random_spclient())
+        self.__metadata_base_url = ApResolver.get_metadata_spclient()
 
     def build_request(
         self,
@@ -196,8 +198,13 @@ class ApiClient(Closeable):
         headers = CaseInsensitiveDict({"content-type": "application/x-protobuf"})
         req = EntityRequest(entity_uri=uri, query=[ExtensionQuery(extension_kind=extension_kind),])
 
-        response = self.send("POST", "/extended-metadata/v0/extended-metadata",
-                             headers, BatchedEntityRequest(entity_request=[req,]).SerializeToString())
+        response = self.sendToUrl(
+            "POST",
+            self.__metadata_base_url,
+            "/extended-metadata/v0/extended-metadata",
+            headers,
+            BatchedEntityRequest(entity_request=[req,]).SerializeToString(),
+        )
         ApiClient.StatusCodeException.check_status(response)
 
         body = response.content
@@ -366,6 +373,7 @@ class ApiClient(Closeable):
 class ApResolver:
     """ """
     base_url = "https://apresolve.spotify.com/"
+    metadata_spclient = "https://spclient.wg.spotify.com"
 
     @staticmethod
     def request(service_type: str) -> typing.Any:
@@ -417,6 +425,15 @@ class ApResolver:
 
         """
         return ApResolver.get_random_of("spclient")
+
+    @staticmethod
+    def get_metadata_spclient() -> str:
+        """Get spclient endpoint for metadata requests.
+
+        :returns: spclient metadata endpoint url
+
+        """
+        return ApResolver.metadata_spclient
 
     @staticmethod
     def get_random_accesspoint() -> str:
