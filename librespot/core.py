@@ -1953,7 +1953,7 @@ class Session(Closeable, MessageListener, SubListener):
             :returns: integer from socket
 
             """
-            return struct.unpack(">i", self.read(4))[0]
+            return struct.unpack(">i", self.read_exact(4))[0]
 
         def read_short(self) -> int:
             """Read short integer from socket
@@ -1962,7 +1962,7 @@ class Session(Closeable, MessageListener, SubListener):
             :returns: short integer from socket
 
             """
-            return struct.unpack(">h", self.read(2))[0]
+            return struct.unpack(">h", self.read_exact(2))[0]
 
         def set_timeout(self, seconds: float) -> None:
             """Set socket's timeout
