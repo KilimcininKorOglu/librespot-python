@@ -346,6 +346,19 @@ class ApiClient(Closeable):
             :param response: requests.Response:
 
             """
+            if response.status_code == 429:
+                req = response.request
+                if req is not None:
+                    ApiClient.logger.warning(
+                        "API rate limit from %s %s",
+                        req.method,
+                        req.url,
+                    )
+                else:
+                    ApiClient.logger.warning(
+                        "API rate limit from %s",
+                        response.url,
+                    )
             if response.status_code != 200:
                 raise ApiClient.StatusCodeException(response)
 
