@@ -17,6 +17,7 @@ import threading
 import time
 import typing
 import urllib.parse
+from typing import Type
 
 import defusedxml.ElementTree
 import requests
@@ -66,6 +67,15 @@ from librespot.structure import Closeable
 from librespot.structure import MessageListener
 from librespot.structure import RequestListener
 from librespot.structure import SubListener
+
+_LOGGER = logging.getLogger("Librespot:MercuryMetadata")
+
+os.environ.setdefault("PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION", "python")
+
+def _ensure_hex_id(identifier, kind: str) -> str:
+    if hasattr(identifier, "hex_id"):
+        return identifier.hex_id()
+    raise TypeError(f"Expected object with hex_id() for {kind} metadata lookups")
 
 
 class ApiClient(Closeable):
@@ -219,16 +229,42 @@ class ApiClient(Closeable):
         mdb: bytes = entityextd.extension_data.value
         return mdb
 
+    def fetch_via_mercury(self, uri: str, proto_cls: Type) -> object:
+        """Return the requested metadata via Mercury; fallback to HTTP."""
+        session = getattr(self, "_ApiClient__session", None)
+        if session is None:
+            raise RuntimeError("librespot ApiClient is not authenticated yet")
+
+        try:
+            response = session.mercury().send_sync(RawMercuryRequest.get(uri))
+            if response.status_code != 200 or not response.payload:
+                raise RuntimeError(f"Mercury metadata request failed ({response.status_code})")
+
+            proto = proto_cls()
+            proto.ParseFromString(response.payload)
+            return proto
+        except Exception as error:
+            _LOGGER.warning(
+                "Mercury metadata request for %s failed (%s); falling back to HTTP",
+                uri,
+                error,
+            )
+            raise
+
     def get_metadata_4_track(self, track: TrackId) -> Metadata.Track:
         """
 
         :param track: TrackId:
 
         """
-        mdb = self.get_ext_metadata(ExtensionKind.TRACK_V4, track.to_spotify_uri())
-        md = Metadata.Track()
-        md.ParseFromString(mdb)
-        return md
+        uri = f"hm://metadata/4/track/{_ensure_hex_id(track, 'track')}"
+        try:
+            return self.fetch_via_mercury(uri, Metadata.Track)
+        except Exception:
+            mdb = self.get_ext_metadata(ExtensionKind.TRACK_V4, track.to_spotify_uri())
+            md = Metadata.Track()
+            md.ParseFromString(mdb)
+            return md
 
     def get_metadata_4_episode(self, episode: EpisodeId) -> Metadata.Episode:
         """
@@ -236,10 +272,14 @@ class ApiClient(Closeable):
         :param episode: EpisodeId:
 
         """
-        mdb = self.get_ext_metadata(ExtensionKind.EPISODE_V4, episode.to_spotify_uri())
-        md = Metadata.Episode()
-        md.ParseFromString(mdb)
-        return md
+        uri = f"hm://metadata/4/episode/{_ensure_hex_id(episode, 'episode')}"
+        try:
+            return self.fetch_via_mercury(uri, Metadata.Episode)
+        except Exception:
+            mdb = self.get_ext_metadata(ExtensionKind.EPISODE_V4, episode.to_spotify_uri())
+            md = Metadata.Episode()
+            md.ParseFromString(mdb)
+            return md
 
     def get_metadata_4_album(self, album: AlbumId) -> Metadata.Album:
         """
@@ -247,10 +287,14 @@ class ApiClient(Closeable):
         :param album: AlbumId:
 
         """
-        mdb = self.get_ext_metadata(ExtensionKind.ALBUM_V4, album.to_spotify_uri())
-        md = Metadata.Album()
-        md.ParseFromString(mdb)
-        return md
+        uri = f"hm://metadata/4/album/{_ensure_hex_id(album, 'album')}"
+        try:
+            return self.fetch_via_mercury(uri, Metadata.Album)
+        except Exception:
+            mdb = self.get_ext_metadata(ExtensionKind.ALBUM_V4, album.to_spotify_uri())
+            md = Metadata.Album()
+            md.ParseFromString(mdb)
+            return md
 
     def get_metadata_4_artist(self, artist: ArtistId) -> Metadata.Artist:
         """
@@ -258,10 +302,14 @@ class ApiClient(Closeable):
         :param artist: ArtistId:
 
         """
-        mdb = self.get_ext_metadata(ExtensionKind.ARTIST_V4, artist.to_spotify_uri())
-        md = Metadata.Artist()
-        md.ParseFromString(mdb)
-        return md
+        uri = f"hm://metadata/4/artist/{_ensure_hex_id(artist, 'artist')}"
+        try:
+            return self.fetch_via_mercury(uri, Metadata.Artist)
+        except Exception:
+            mdb = self.get_ext_metadata(ExtensionKind.ARTIST_V4, artist.to_spotify_uri())
+            md = Metadata.Artist()
+            md.ParseFromString(mdb)
+            return md
 
     def get_metadata_4_show(self, show: ShowId) -> Metadata.Show:
         """
@@ -269,10 +317,14 @@ class ApiClient(Closeable):
         :param show: ShowId:
 
         """
-        mdb = self.get_ext_metadata(ExtensionKind.SHOW_V4, show.to_spotify_uri())
-        md = Metadata.Show()
-        md.ParseFromString(mdb)
-        return md
+        uri = f"hm://metadata/4/show/{_ensure_hex_id(show, 'show')}"
+        try:
+            return self.fetch_via_mercury(uri, Metadata.Show)
+        except Exception:
+            mdb = self.get_ext_metadata(ExtensionKind.SHOW_V4, show.to_spotify_uri())
+            md = Metadata.Show()
+            md.ParseFromString(mdb)
+            return md
 
     def get_playlist(self,
                      _id: PlaylistId) -> Playlist4External.SelectedListContent:
