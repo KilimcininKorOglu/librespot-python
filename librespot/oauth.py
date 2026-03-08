@@ -139,6 +139,16 @@ class OAuth:
                 "type": self.OAUTH_PKCE_TOKEN
             }, f)
 
+    def get_token_response_data(self) -> dict:
+        """Return token data as a dictionary for database storage."""
+        return {
+            "client_id": self.__client_id,
+            "access_token": self.__token,
+            "expires_at": self.__token_expires_at.timestamp(),
+            "refresh_token": self.__refresh_token,
+            "type": self.OAUTH_PKCE_TOKEN
+        }
+
     def get_credentials(self):
         if not self.__token:
             raise RuntimeError("You need to request a token bore!")
