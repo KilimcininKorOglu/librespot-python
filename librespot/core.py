@@ -1058,12 +1058,25 @@ class Session(Closeable, MessageListener, SubListener):
             self.__event_service = EventService(self)
             self.__auth_lock_bool = False
             self.__auth_lock.notify_all()
-        self.dealer().connect()
+        # The dealer is the Spotify Connect websocket. Opening it needs a Login5
+        # access token, which Spotify refuses for stored credentials, and nothing
+        # in the metadata or audio path goes through it. Treat it as optional so
+        # a rejected Login5 request no longer aborts an otherwise valid login.
+        dealer_connected = False
+        try:
+            self.dealer().connect()
+            dealer_connected = True
+        except Exception as e:
+            self.logger.warning(
+                "Dealer unavailable, continuing without Spotify Connect: {}".
+                format(e))
+
         self.logger.info("Authenticated as {}!".format(
             self.__ap_welcome.canonical_username))
         self.mercury().interested_in("spotify:user:attributes:update", self)
-        self.dealer().add_message_listener(
-            self, ["hm://connect-state/v1/connect/logout"])
+        if dealer_connected:
+            self.dealer().add_message_listener(
+                self, ["hm://connect-state/v1/connect/logout"])
 
     def cache(self) -> CacheManager:
         """ """
@@ -2378,7 +2391,11 @@ class TokenProvider:
         :param scope: str:
 
         """
-        return self.get_token(scope).access_token
+        token = self.get_token(scope)
+        if token is None:
+            raise RuntimeError(
+                "Login5 returned no access token for scope '{}'".format(scope))
+        return token.access_token
 
     def get_token(self, *scopes) -> StoredToken:
         """
