@@ -2370,6 +2370,11 @@ class TokenProvider:
     __session: Session
     __tokens: typing.List[StoredToken] = []
 
+    # Optional callable(scopes) -> (access_token, expires_in) | None.
+    # Spotify rejects the Login5 stored-credential request, so an embedder that
+    # can mint a web player token supplies one here to keep spclient usable.
+    external_token_provider = None
+
     def __init__(self, session: Session):
         self.__session = session
 
@@ -2415,11 +2420,44 @@ class TokenProvider:
             else:
                 return token
 
+        token = self.external(scopes)
+        if token is not None:
+            self.__tokens.append(token)
+            self.logger.debug("Using external access token for scopes: {}".format(scopes))
+            return token
+
         token = self.login5(scopes)
         if token is not None:
             self.__tokens.append(token)
             self.logger.debug("Using Login5 access token for scopes: {}".format(scopes))
         return token
+
+    def external(self, scopes: typing.List[str]) -> typing.Union[StoredToken, None]:
+        """Ask the embedder for an access token.
+
+        Tried before Login5 because Spotify currently answers Login5 stored
+        credential requests with INVALID_CREDENTIALS, and every attempt costs a
+        round trip.
+        """
+        provider = TokenProvider.external_token_provider
+        if provider is None:
+            return None
+        try:
+            result = provider(scopes)
+            if not result:
+                return None
+            access_token, expires_in = result
+            if not access_token:
+                return None
+            return TokenProvider.StoredToken({
+                "expiresIn": int(expires_in),
+                "accessToken": access_token,
+                "scope": scopes,
+            })
+        except Exception as e:
+            self.logger.warning(
+                "External token provider failed for scopes {}: {}".format(scopes, e))
+            return None
 
     def login5(self, scopes: typing.List[str]) -> typing.Union[StoredToken, None]:
         """Submit Login5 request for a fresh access token"""
