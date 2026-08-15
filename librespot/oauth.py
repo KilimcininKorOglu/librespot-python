@@ -73,7 +73,9 @@ class OAuth:
 
     def ingest_token_response(self, result):
         self.__token = result["access_token"]
-        self.__refresh_token = result["refresh_token"]
+        # A refresh response may omit refresh_token. The stored one stays valid,
+        # so keep it instead of raising KeyError.
+        self.__refresh_token = result.get("refresh_token") or self.__refresh_token
         if "expires_in" in result:
             self.__token_expires_at = datetime.now() + timedelta(seconds=result["expires_in"])
         elif "expires_at" in result:
