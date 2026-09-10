@@ -24,6 +24,50 @@ import urllib.parse
 if typing.TYPE_CHECKING:
     from librespot.core import Session
 
+WEB_API_STORAGE_RESOLVE_URL = "https://api.spotify.com/v1/storage-resolve/files/audio/interactive/{}"
+
+
+class StorageResolveFallback:
+    """Last-resort storage resolution through the Spotify Web API.
+
+    spclient stays the primary route. This endpoint accepts an OAuth Web API
+    token, which spclient answers with HTTP 403, so it survives an spclient
+    outage and a missing web player token. It is rate limited, so only call it
+    after the spclient routes fail.
+
+    The embedder assigns token_provider, a callable returning an OAuth Web API
+    token or None. librespot never imports the embedder.
+    """
+
+    token_provider = None
+
+    @staticmethod
+    def resolve(session, file_id: bytes) -> typing.Union[bytes, None]:
+        """Return the raw StorageResolveResponse bytes, or None."""
+        provider = StorageResolveFallback.token_provider
+        if provider is None:
+            return None
+        try:
+            token = provider()
+        except Exception:
+            return None
+        if not token:
+            return None
+
+        try:
+            # Send it plain. Adding ?alt=json switches the reply to JSON, and
+            # the caller parses protobuf.
+            response = session.client().get(
+                WEB_API_STORAGE_RESOLVE_URL.format(util.bytes_to_hex(file_id)),
+                headers={"Authorization": "Bearer {}".format(token)},
+            )
+        except Exception:
+            return None
+
+        if response.status_code != 200 or not response.content:
+            return None
+        return response.content
+
 
 class AbsChunkedInputStream(io.BytesIO, HaltListener):
     chunk_exception = None
@@ -444,8 +488,11 @@ class CdnManager:
             halt_listener,
         )
 
-    def _resolve_storage(self, file_id: bytes, audio_format=None):
-        """Resolve storage for a file, versioned route first."""
+    def _resolve_storage(self, file_id: bytes, audio_format=None) -> bytes:
+        """Resolve storage for a file. Versioned spclient route first.
+
+        Order: spclient v2, spclient legacy, then the Web API fallback.
+        """
         hex_id = util.bytes_to_hex(file_id)
         paths = []
         if audio_format is not None:
@@ -458,8 +505,13 @@ class CdnManager:
         for path in paths:
             response = self.__session.api().send("GET", path, None, None)
             last_status = response.status_code
-            if response.status_code == 200:
-                return response
+            if response.status_code == 200 and response.content:
+                return response.content
+
+        body = StorageResolveFallback.resolve(self.__session, file_id)
+        if body:
+            self.logger.debug("Storage resolved through the Web API fallback")
+            return body
         raise IOError(last_status)
 
     def get_audio_urls(self, file_id: bytes, audio_format=None) -> typing.List[str]:
@@ -469,10 +521,7 @@ class CdnManager:
         error while the others still serve the file, so the caller keeps the
         whole list and falls back through it.
         """
-        response = self._resolve_storage(file_id, audio_format)
-        body = response.content
-        if body is None:
-            raise IOError("Response body is empty!")
+        body = self._resolve_storage(file_id, audio_format)
         proto = StorageResolve.StorageResolveResponse()
         proto.ParseFromString(body)
         if proto.result == StorageResolve.StorageResolveResponse.Result.CDN:
@@ -910,21 +959,30 @@ class PlayableContentFeeder:
                       if preload else self.storage_resolve_interactive).format(hex_id))
         return paths
 
+    @staticmethod
+    def _parse_storage(body: bytes) -> StorageResolve.StorageResolveResponse:
+        storage_resolve_response = StorageResolve.StorageResolveResponse()
+        storage_resolve_response.ParseFromString(body)
+        return storage_resolve_response
+
     def resolve_storage_interactive(
             self, file_id: bytes, preload: bool,
             audio_format=None) -> StorageResolve.StorageResolveResponse:
+        """Resolve storage. Order: spclient v2, spclient legacy, Web API fallback."""
         last_status = None
         for path in self._storage_paths(file_id, preload, audio_format):
             resp = self.__session.api().send("GET", path, None, None)
             last_status = resp.status_code
             if resp.status_code != 200:
                 continue
-            body = resp.content
-            if body is None:
+            if not resp.content:
                 raise RuntimeError("Response body is empty!")
-            storage_resolve_response = StorageResolve.StorageResolveResponse()
-            storage_resolve_response.ParseFromString(body)
-            return storage_resolve_response
+            return self._parse_storage(resp.content)
+
+        body = StorageResolveFallback.resolve(self.__session, file_id)
+        if body:
+            self.logger.debug("Storage resolved through the Web API fallback")
+            return self._parse_storage(body)
         raise RuntimeError(last_status)
 
 
