@@ -227,14 +227,16 @@ class AbsChunkedInputStream(io.BytesIO, HaltListener):
 class AudioKeyManager(PacketsReceiver, Closeable):
     audio_key_request_timeout = 20
     logger = logging.getLogger("Librespot:AudioKeyManager")
-    __callbacks: typing.Dict[int, Callback] = {}
-    __seq_holder = 0
-    __seq_holder_lock = threading.Condition()
     __session: Session
     __zero_short = b"\x00\x00"
 
     def __init__(self, session: Session):
         self.__session = session
+        # These belong to one manager. As class attributes every instance
+        # shared the same pending map and sequence counter.
+        self.__callbacks: typing.Dict[int, AudioKeyManager.Callback] = {}
+        self.__seq_holder = 0
+        self.__seq_holder_lock = threading.Condition()
 
     def dispatch(self, packet: Packet) -> None:
         payload = io.BytesIO(packet.payload)
@@ -269,10 +271,19 @@ class AudioKeyManager(PacketsReceiver, Closeable):
         out.write(struct.pack(">i", seq))
         out.write(self.__zero_short)
         out.seek(0)
-        self.__session.send(Packet.Type.request_key, out.read())
+
+        # Register the callback before sending, because the reply can arrive
+        # before the assignment and dispatch would then drop it.
         callback = AudioKeyManager.SyncCallback(self)
         self.__callbacks[seq] = callback
-        key = callback.wait_response()
+        try:
+            self.__session.send(Packet.Type.request_key, out.read())
+            key = callback.wait_response()
+        finally:
+            # Drop the pending entry on every path, including a timeout,
+            # so the map does not grow for the life of the process.
+            self.__callbacks.pop(seq, None)
+
         if key is None:
             if retry:
                 return self.get_audio_key(gid, file_id, False)
@@ -291,11 +302,14 @@ class AudioKeyManager(PacketsReceiver, Closeable):
 
     class SyncCallback(Callback):
         __audio_key_manager: AudioKeyManager
-        __reference = queue.Queue()
-        __reference_lock = threading.Condition()
 
         def __init__(self, audio_key_manager: AudioKeyManager):
             self.__audio_key_manager = audio_key_manager
+            # One queue and one lock per request. As class attributes every
+            # callback shared them, so a concurrent request could take
+            # another request's key.
+            self.__reference = queue.Queue()
+            self.__reference_lock = threading.Condition()
 
         def key(self, key: bytes) -> None:
             with self.__reference_lock:
@@ -309,11 +323,20 @@ class AudioKeyManager(PacketsReceiver, Closeable):
                 self.__reference.put(None)
                 self.__reference_lock.notify_all()
 
-        def wait_response(self) -> bytes:
+        def wait_response(self) -> typing.Union[bytes, None]:
+            """Return the key, or None when the request timed out.
+
+            A timeout leaves the queue empty. Returning None instead of
+            raising queue.Empty lets get_audio_key retry, which it could
+            not do before.
+            """
             with self.__reference_lock:
                 self.__reference_lock.wait(
                     AudioKeyManager.audio_key_request_timeout)
-                return self.__reference.get(block=False)
+                try:
+                    return self.__reference.get(block=False)
+                except queue.Empty:
+                    return None
 
 
 class CdnFeedHelper:
