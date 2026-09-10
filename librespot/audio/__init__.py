@@ -421,7 +421,13 @@ class CdnManager:
             halt_listener,
         )
 
-    def get_audio_url(self, file_id: bytes):
+    def get_audio_urls(self, file_id: bytes) -> typing.List[str]:
+        """Return every CDN url Spotify offers for this file, in random order.
+
+        Spotify hands out several endpoints. Any one of them can answer with an
+        error while the others still serve the file, so the caller keeps the
+        whole list and falls back through it.
+        """
         response = self.__session.api()\
             .send("GET", "/storage-resolve/files/audio/interactive/{}".format(util.bytes_to_hex(file_id)), None, None)
         if response.status_code != 200:
@@ -432,12 +438,19 @@ class CdnManager:
         proto = StorageResolve.StorageResolveResponse()
         proto.ParseFromString(body)
         if proto.result == StorageResolve.StorageResolveResponse.Result.CDN:
-            url = random.choice(proto.cdnurl)
-            self.logger.debug("Fetched CDN url for {}: {}".format(
-                util.bytes_to_hex(file_id), url))
-            return url
+            urls = list(proto.cdnurl)
+            random.shuffle(urls)
+            self.logger.debug("Fetched {} CDN url(s) for {}".format(
+                len(urls), util.bytes_to_hex(file_id)))
+            return urls
         raise CdnManager.CdnException(
             "Could not retrieve CDN url! result: {}".format(proto.result))
+
+    def get_audio_url(self, file_id: bytes):
+        urls = self.get_audio_urls(file_id)
+        if not urls:
+            raise CdnManager.CdnException("Could not retrieve CDN url! empty list")
+        return urls[0]
 
     class CdnException(Exception):
         pass
@@ -460,7 +473,35 @@ class CdnManager:
                      url: str):
             self.__cdn_manager: CdnManager = cdn_manager
             self.__file_id = file_id
+            self.__alternatives: typing.List[str] = []
+            self.__alternatives_loaded = False
+            self.__tried: typing.Set[str] = set()
             self.set_url(url)
+
+        def next_url(self) -> bool:
+            """Move to another CDN url. Return False when no other url is left.
+
+            One endpoint can answer with an error while the others still serve
+            the file, so a failed chunk request tries the next url instead of
+            failing the whole download. Each url is tried at most once, and the
+            url list is resolved at most once.
+            """
+            if self.__file_id is None:
+                return False
+
+            self.__tried.add(self.url)
+            if not self.__alternatives_loaded:
+                try:
+                    self.__alternatives = self.__cdn_manager.get_audio_urls(self.__file_id)
+                except (IOError, CdnManager.CdnException):
+                    return False
+                self.__alternatives_loaded = True
+
+            for candidate in self.__alternatives:
+                if candidate not in self.__tried:
+                    self.set_url(candidate)
+                    return True
+            return False
 
         def url(self):
             if self.__expiration == -1:
@@ -595,6 +636,14 @@ class CdnManager:
             response = self.request(index)
             self.write_chunk(response.buffer, index, False)
 
+        def _fetch_range(self, range_start: int, range_end: int):
+            return self.__session.client().get(
+                self.__cdn_url.url,
+                headers=CaseInsensitiveDict({
+                    "Range": "bytes={}-{}".format(range_start, range_end)
+                }),
+            )
+
         def request(self, chunk: int = None, range_start: int = None, range_end: int = None)\
                 -> CdnManager.InternalResponse:
             if chunk is None and range_start is None and range_end is None:
@@ -602,14 +651,18 @@ class CdnManager:
             if chunk is not None:
                 range_start = ChannelManager.chunk_size * chunk
                 range_end = (chunk + 1) * ChannelManager.chunk_size - 1
-            response = self.__session.client().get(
-                self.__cdn_url.url,
-                headers=CaseInsensitiveDict({
-                    "Range": "bytes={}-{}".format(range_start, range_end)
-                }),
-            )
-            if response.status_code != 206:
-                raise IOError(response.status_code)
+
+            # A range request must answer 206. Any other status means this CDN
+            # endpoint failed, so move to the next url before giving up.
+            response = self._fetch_range(range_start, range_end)
+            while response.status_code != 206:
+                CdnManager.logger.warning(
+                    "CDN url answered {}, trying the next one".format(
+                        response.status_code))
+                if not self.__cdn_url.next_url():
+                    raise IOError(response.status_code)
+                response = self._fetch_range(range_start, range_end)
+
             body = response.content
             if body is None:
                 raise IOError("Response body is empty!")
