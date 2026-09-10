@@ -438,23 +438,38 @@ class CdnManager:
             self.__session,
             StreamId(file=file),
             SuperAudioFormat.get(file.format),
-            CdnManager.CdnUrl(self, file.file_id, url),
+            CdnManager.CdnUrl(self, file.file_id, url, file.format),
             self.__session.cache(),
             AesAudioDecrypt(key),
             halt_listener,
         )
 
-    def get_audio_urls(self, file_id: bytes) -> typing.List[str]:
+    def _resolve_storage(self, file_id: bytes, audio_format=None):
+        """Resolve storage for a file, versioned route first."""
+        hex_id = util.bytes_to_hex(file_id)
+        paths = []
+        if audio_format is not None:
+            # The v2 route needs the numeric format value; the name gives 404.
+            paths.append("/storage-resolve/v2/files/audio/interactive/{}/{}".format(
+                int(audio_format), hex_id))
+        paths.append("/storage-resolve/files/audio/interactive/{}".format(hex_id))
+
+        last_status = None
+        for path in paths:
+            response = self.__session.api().send("GET", path, None, None)
+            last_status = response.status_code
+            if response.status_code == 200:
+                return response
+        raise IOError(last_status)
+
+    def get_audio_urls(self, file_id: bytes, audio_format=None) -> typing.List[str]:
         """Return every CDN url Spotify offers for this file, in random order.
 
         Spotify hands out several endpoints. Any one of them can answer with an
         error while the others still serve the file, so the caller keeps the
         whole list and falls back through it.
         """
-        response = self.__session.api()\
-            .send("GET", "/storage-resolve/files/audio/interactive/{}".format(util.bytes_to_hex(file_id)), None, None)
-        if response.status_code != 200:
-            raise IOError(response.status_code)
+        response = self._resolve_storage(file_id, audio_format)
         body = response.content
         if body is None:
             raise IOError("Response body is empty!")
@@ -469,8 +484,8 @@ class CdnManager:
         raise CdnManager.CdnException(
             "Could not retrieve CDN url! result: {}".format(proto.result))
 
-    def get_audio_url(self, file_id: bytes):
-        urls = self.get_audio_urls(file_id)
+    def get_audio_url(self, file_id: bytes, audio_format=None):
+        urls = self.get_audio_urls(file_id, audio_format)
         if not urls:
             raise CdnManager.CdnException("Could not retrieve CDN url! empty list")
         return urls[0]
@@ -493,9 +508,10 @@ class CdnManager:
         url: str
 
         def __init__(self, cdn_manager, file_id: typing.Union[bytes, None],
-                     url: str):
+                     url: str, audio_format=None):
             self.__cdn_manager: CdnManager = cdn_manager
             self.__file_id = file_id
+            self.__audio_format = audio_format
             self.__alternatives: typing.List[str] = []
             self.__alternatives_loaded = False
             self.__tried: typing.Set[str] = set()
@@ -515,7 +531,8 @@ class CdnManager:
             self.__tried.add(self.url)
             if not self.__alternatives_loaded:
                 try:
-                    self.__alternatives = self.__cdn_manager.get_audio_urls(self.__file_id)
+                    self.__alternatives = self.__cdn_manager.get_audio_urls(
+                        self.__file_id, self.__audio_format)
                 except (IOError, CdnManager.CdnException):
                     return False
                 self.__alternatives_loaded = True
@@ -776,6 +793,11 @@ class PlayableContentFeeder:
     logger = logging.getLogger("Librespot:PlayableContentFeeder")
     storage_resolve_interactive = "/storage-resolve/files/audio/interactive/{}"
     storage_resolve_interactive_prefetch = "/storage-resolve/files/audio/interactive_prefetch/{}"
+    # The current Spotify desktop client uses this versioned route. It needs the
+    # NUMERIC Metadata.AudioFile.Format value; the format name returns HTTP 404.
+    # Only the interactive route was measured, so prefetch stays on the legacy
+    # route. The legacy route still answers HTTP 200 and remains the fallback.
+    storage_resolve_interactive_v2 = "/storage-resolve/v2/files/audio/interactive/{}/{}"
     __session: Session
 
     def __init__(self, session: Session):
@@ -799,7 +821,7 @@ class PlayableContentFeeder:
             raise RuntimeError("No content passed!")
         elif file is None:
             raise RuntimeError("Content has no audio file!")
-        response = self.resolve_storage_interactive(file.file_id, preload)
+        response = self.resolve_storage_interactive(file.file_id, preload, file.format)
         if response.result == StorageResolve.StorageResolveResponse.Result.CDN:
             return CdnFeedHelper.load_content(self.__session, track_or_episode, file,
                                             response, preload, halt_lister)
@@ -876,25 +898,34 @@ class PlayableContentFeeder:
                     licensor=track.licensor)
         return None
 
+    def _storage_paths(self, file_id: bytes, preload: bool,
+                       audio_format=None) -> typing.List[str]:
+        """Return the routes to try, most current first."""
+        hex_id = util.bytes_to_hex(file_id)
+        paths = []
+        if audio_format is not None and not preload:
+            paths.append(self.storage_resolve_interactive_v2.format(
+                int(audio_format), hex_id))
+        paths.append((self.storage_resolve_interactive_prefetch
+                      if preload else self.storage_resolve_interactive).format(hex_id))
+        return paths
+
     def resolve_storage_interactive(
-            self, file_id: bytes,
-            preload: bool) -> StorageResolve.StorageResolveResponse:
-        resp = self.__session.api().send(
-            "GET",
-            (self.storage_resolve_interactive_prefetch
-             if preload else self.storage_resolve_interactive).format(
-                 util.bytes_to_hex(file_id)),
-            None,
-            None,
-        )
-        if resp.status_code != 200:
-            raise RuntimeError(resp.status_code)
-        body = resp.content
-        if body is None:
-            raise RuntimeError("Response body is empty!")
-        storage_resolve_response = StorageResolve.StorageResolveResponse()
-        storage_resolve_response.ParseFromString(body)
-        return storage_resolve_response
+            self, file_id: bytes, preload: bool,
+            audio_format=None) -> StorageResolve.StorageResolveResponse:
+        last_status = None
+        for path in self._storage_paths(file_id, preload, audio_format):
+            resp = self.__session.api().send("GET", path, None, None)
+            last_status = resp.status_code
+            if resp.status_code != 200:
+                continue
+            body = resp.content
+            if body is None:
+                raise RuntimeError("Response body is empty!")
+            storage_resolve_response = StorageResolve.StorageResolveResponse()
+            storage_resolve_response.ParseFromString(body)
+            return storage_resolve_response
+        raise RuntimeError(last_status)
 
 
 class LoadedStream:
